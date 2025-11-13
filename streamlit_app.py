@@ -1,137 +1,134 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json
+import plotly.express as px
 from io import BytesIO
 from datetime import datetime
-import plotly.express as px
 
-# --- CONFIGURACIÓN DE LA APP ---
-st.set_page_config(page_title="📊 ODEPA - Dashboard de productos", layout="wide", page_icon="🍅")
-st.title("📊 Dashboard histórico ODEPA - Hortalizas Lo Valledor")
+# --- CONFIGURACIÓN GENERAL ---
+st.set_page_config(page_title="Tomate ODEPA", layout="wide")
+st.title("🍅 Dashboard de Precios - ODEPA")
 
-# === URL DEL ÍNDICE JSON (generado por tu Google Script) ===
-INDEX_URL = "https://drive.google.com/uc?export=download&id=1VgfxrxFb3lv8j71MOoUACeleLbo81IAw"  # 👈 reemplázalo por el ID real
+# === CONFIGURACIÓN ===
+# URL del archivo JSON con el índice histórico (desde tu carpeta Drive pública)
+INDEX_URL = "https://drive.google.com/uc?export=download&id=1-xLlbd8gEtnUWMp0CGp6gbzssTL60EdM"
 
-# --- FUNCIONES AUXILIARES ---
-@st.cache_data
-def obtener_archivos_desde_json(index_url):
-    """Lee el índice JSON con los metadatos de todos los boletines descargados."""
+# --- FUNCIONES ---
+@st.cache_data(ttl=600)
+def cargar_index(url):
+    """Carga el JSON con la lista de archivos disponibles."""
     try:
-        r = requests.get(index_url, timeout=15)
-        if r.status_code != 200:
-            raise ValueError(f"Error HTTP {r.status_code} al acceder al índice.")
-        content = r.text.strip()
-        if not content or content.startswith("<!DOCTYPE"):
-            raise ValueError("Drive devolvió HTML en lugar del JSON. Verifica que sea público.")
-        data = json.loads(content)
-        if not isinstance(data, list):
-            raise ValueError("El índice JSON no tiene formato de lista.")
-        return data
+        data = requests.get(url).json()
+        if isinstance(data, dict):
+            data = [data]
+        return sorted(data, key=lambda x: x["fecha"], reverse=True)
     except Exception as e:
-        raise ValueError(f"No se pudo leer el índice: {e}")
+        raise ValueError(f"No se pudo leer el JSON: {e}")
 
-@st.cache_data
+@st.cache_data(ttl=600)
 def leer_excel(url, hoja="Hortalizas_Lo Valledor", skiprows=8):
-    """Descarga y lee un archivo Excel desde una URL de descarga directa."""
-    r = requests.get(url, allow_redirects=True, timeout=20)
-    content_type = r.headers.get("Content-Type", "")
-    primeros_bytes = r.content[:100]
-
-    if "html" in content_type.lower() or primeros_bytes.startswith(b"<!DOCTYPE"):
-        raise ValueError("Drive devolvió HTML en lugar de Excel (verifica permisos).")
-
+    """Lee un archivo Excel desde Drive y devuelve un DataFrame limpio."""
     try:
-        df = pd.read_excel(BytesIO(r.content), sheet_name=hoja, skiprows=skiprows, engine="openpyxl")
-        return df
+        r = requests.get(url)
+        r.raise_for_status()
+        return pd.read_excel(BytesIO(r.content), sheet_name=hoja, skiprows=skiprows, engine="openpyxl")
     except Exception as e:
         raise ValueError(f"Error al leer Excel: {e}")
 
-# --- PROCESAMIENTO PRINCIPAL ---
+# --- CARGAR JSON HISTÓRICO ---
 try:
-    # Cargar lista de archivos desde el JSON
-    archivos = obtener_archivos_desde_json(INDEX_URL)
+    index = cargar_index(INDEX_URL)
+    fechas_disponibles = [i["fecha"] for i in index]
+    st.sidebar.header("📅 Filtros de visualización")
 
-    if not archivos:
-        st.error("❌ No se encontraron boletines en el índice JSON.")
-        st.stop()
+    fecha_seleccionada = st.sidebar.selectbox("Selecciona una fecha", fechas_disponibles)
+    meta = next(item for item in index if item["fecha"] == fecha_seleccionada)
 
-    # Mostrar el último boletín en el sidebar
-    ultimo = archivos[0]
-    st.sidebar.info(f"🗓️ Último boletín: {ultimo['fecha']}")
-    st.sidebar.write(f"📄 Archivo: {ultimo['nombre']}")
+    st.sidebar.markdown(f"**Archivo seleccionado:** `{meta['nombre']}`")
+    st.sidebar.markdown(f"[Descargar Excel]({meta['url_descarga']})")
 
-    # Construir histórico
-    historico = []
-    for meta in archivos:
-        try:
-            url = meta["url_descarga"]
-            df = leer_excel(url)
-            df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-            df["fecha_boletin"] = meta["fecha"]
-            historico.append(df)
-        except Exception as e:
-            st.warning(f"⚠️ Error al leer {meta['nombre']}: {e}")
+    # --- CARGAR DATOS DEL EXCEL ---
+    df = leer_excel(meta["url_descarga"])
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
 
-    if not historico:
-        st.warning("⚠️ No se encontró información en los boletines.")
-        st.stop()
+    # --- SELECCIÓN DE PRODUCTO ---
+    col_producto = [c for c in df.columns if "producto" in c or "especie" in c]
+    if not col_producto:
+        st.error("No se encontró columna de producto o especie.")
+    else:
+        col_producto = col_producto[0]
+        productos = sorted(df[col_producto].dropna().unique())
+        producto_seleccionado = st.sidebar.selectbox("Selecciona un producto", productos)
 
-    # Combinar todos los boletines
-    df_hist = pd.concat(historico, ignore_index=True)
-    st.success(f"✅ Histórico cargado: {df_hist['fecha_boletin'].nunique()} días, {len(df_hist)} registros totales.")
+        # Filtrar por producto
+        df_filtrado = df[df[col_producto].str.contains(producto_seleccionado, case=False, na=False)]
 
-    # --- DETECCIÓN AUTOMÁTICA DE COLUMNAS ---
-    col_producto = next((c for c in df_hist.columns if "producto" in c or "especie" in c), None)
-    col_variedad = next((c for c in df_hist.columns if "variedad" in c), None)
-    col_precio = next((c for c in df_hist.columns if "precio" in c), None)
-    col_volumen = next((c for c in df_hist.columns if "volumen" in c), None)
-    col_origen = next((c for c in df_hist.columns if "origen" in c), None)
+        if df_filtrado.empty:
+            st.warning("No se encontraron registros para ese producto.")
+        else:
+            # Buscar columnas relevantes
+            col_precio = [c for c in df.columns if "precio" in c.lower()]
+            col_variedad = [c for c in df.columns if "variedad" in c.lower()]
+            col_origen = [c for c in df.columns if "origen" in c.lower()]
+            col_volumen = [c for c in df.columns if "volumen" in c.lower()]
 
-    if not col_producto or not col_precio:
-        st.error("❌ No se detectaron columnas de producto o precio en los boletines.")
-        st.stop()
+            # --- MÉTRICAS ---
+            st.subheader(f"📊 Resumen para {producto_seleccionado} ({fecha_seleccionada})")
 
-    # --- FILTRO DE PRODUCTO ---
-    productos = sorted(df_hist[col_producto].dropna().unique())
-    producto_sel = st.selectbox("🥕 Selecciona un producto", productos)
+            if col_precio:
+                col_precio = col_precio[0]
+                precio_prom = df_filtrado[col_precio].mean()
+                st.metric("💰 Precio promedio ($/kg)", f"{precio_prom:,.0f}")
 
-    df_prod = df_hist[df_hist[col_producto] == producto_sel]
+            if col_volumen:
+                col_volumen = col_volumen[0]
+                volumen_total = df_filtrado[col_volumen].sum()
+                st.metric("📦 Volumen total (kg)", f"{volumen_total:,.0f}")
 
-    # --- FILTRO DE VARIEDAD ---
-    if col_variedad:
-        variedades = sorted(df_prod[col_variedad].dropna().unique())
-        variedad_sel = st.selectbox("🍅 Selecciona variedad (opcional)", ["Todas"] + variedades)
-        if variedad_sel != "Todas":
-            df_prod = df_prod[df_prod[col_variedad] == variedad_sel]
+            # --- GRÁFICOS ---
+            if col_variedad:
+                st.markdown("### 🌿 Precio promedio por variedad")
+                df_var = (
+                    df_filtrado.groupby(col_variedad[0])[col_precio].mean().reset_index()
+                    .sort_values(col_precio, ascending=False)
+                )
+                fig1 = px.bar(df_var, x=col_variedad[0], y=col_precio, text_auto=".2s",
+                              color=col_variedad[0], title="Precio promedio por variedad")
+                st.plotly_chart(fig1, use_container_width=True)
 
-    # --- FILTRO DE ORIGEN ---
-    if col_origen:
-        origenes = sorted(df_prod[col_origen].dropna().unique())
-        origen_sel = st.multiselect("🌍 Selecciona origen (opcional)", origenes, default=origenes)
-        df_prod = df_prod[df_prod[col_origen].isin(origen_sel)]
+            if col_origen:
+                st.markdown("### 🗺️ Precio promedio por origen")
+                df_ori = (
+                    df_filtrado.groupby(col_origen[0])[col_precio].mean().reset_index()
+                    .sort_values(col_precio, ascending=False)
+                )
+                fig2 = px.bar(df_ori, x=col_origen[0], y=col_precio, text_auto=".2s",
+                              color=col_origen[0], title="Precio promedio por origen")
+                st.plotly_chart(fig2, use_container_width=True)
 
-    # --- GRÁFICOS ---
-    if col_precio:
-        fig_precio = px.line(
-            df_prod.groupby("fecha_boletin")[col_precio].mean().reset_index(),
-            x="fecha_boletin", y=col_precio,
-            title=f"📈 Evolución del precio promedio de {producto_sel}",
-            markers=True,
-        )
-        st.plotly_chart(fig_precio, use_container_width=True)
+            # --- DATOS HISTÓRICOS ---
+            st.markdown("### 📈 Evolución histórica del producto")
 
-    if col_volumen:
-        fig_volumen = px.bar(
-            df_prod.groupby("fecha_boletin")[col_volumen].sum().reset_index(),
-            x="fecha_boletin", y=col_volumen,
-            title=f"📦 Volumen comercializado de {producto_sel}"
-        )
-        st.plotly_chart(fig_volumen, use_container_width=True)
+            historico = []
+            for item in index:
+                try:
+                    df_temp = leer_excel(item["url_descarga"])
+                    df_temp.columns = [str(c).strip().lower().replace(" ", "_") for c in df_temp.columns]
+                    if col_producto in df_temp.columns and col_precio in df_temp.columns:
+                        mask = df_temp[col_producto].str.contains(producto_seleccionado, case=False, na=False)
+                        precios = df_temp.loc[mask, col_precio]
+                        if not precios.empty:
+                            historico.append({"fecha": item["fecha"], "precio_prom": precios.mean()})
+                except Exception:
+                    continue
 
-    # --- TABLA DETALLADA ---
-    with st.expander("📋 Ver tabla completa"):
-        st.dataframe(df_prod, use_container_width=True)
+            if historico:
+                df_hist = pd.DataFrame(historico)
+                fig3 = px.line(df_hist, x="fecha", y="precio_prom", markers=True,
+                               title=f"Evolución histórica de precios - {producto_seleccionado}")
+                st.plotly_chart(fig3, use_container_width=True)
+            else:
+                st.info("No hay datos históricos suficientes para este producto.")
 
 except Exception as e:
     st.error(f"❌ Error al procesar los archivos: {e}")
