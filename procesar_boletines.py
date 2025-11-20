@@ -3,6 +3,9 @@ import pandas as pd
 import sqlite3
 from io import BytesIO
 import re
+import os
+import subprocess
+from datetime import datetime
 
 # ==============================
 # CONFIG
@@ -15,7 +18,7 @@ INDEX_URL = "https://drive.google.com/uc?export=download&id=19iTAfHR584pr63fECI1
 # 1. Descargar índice JSON
 # ==============================
 def cargar_index():
-    print("📥 Descargando índice de archivos...")
+    print("\n📥 Descargando índice de archivos desde Google Drive...")
     r = requests.get(INDEX_URL)
 
     try:
@@ -26,7 +29,7 @@ def cargar_index():
     if isinstance(data, dict):
         data = [data]
 
-    print(f"📑 {len(data)} boletines encontrados en el índice.")
+    print(f"📑 {len(data)} boletines listados en el índice.")
     return data
 
 
@@ -40,7 +43,7 @@ def normalizar_columnas(df):
         .str.lower()
         .str.replace(" ", "_")
         .str.replace(r"\n", "_", regex=True)
-        .str.normalize("NFKD")  # elimina tildes correctamente
+        .str.normalize("NFKD")
         .str.encode("ascii", errors="ignore")
         .str.decode("utf-8")
     )
@@ -73,30 +76,22 @@ def adaptar_columnas(df):
 
 
 # ==============================
-# 4. Descarga directa desde Google Drive (sin confirm token)
+# 4. Descarga directa desde Google Drive
 # ==============================
 def descargar_excel(url):
-    """
-    Descarga segura desde Google Drive usando un endpoint que evita el confirm token.
-    """
-
-    # Extraer ID
     m = re.search(r"id=([^&]+)", url)
     if not m:
-        print("❌ No se pudo extraer el ID del archivo.")
+        print("❌ No se pudo extraer ID de Google Drive.")
         return None
 
     file_id = m.group(1)
-
-    # Link robusto
     direct_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
 
     r = requests.get(direct_url)
     ctype = r.headers.get("Content-Type", "").lower()
 
-    # Validar que NO sea HTML
     if "html" in ctype:
-        print("❌ ERROR: Google Drive bloqueó la descarga (archivo no público).")
+        print("❌ Google Drive bloqueó la descarga (archivo privado o token inválido).")
         return None
 
     return r.content
@@ -122,7 +117,7 @@ def procesar_excel(url_excel, fecha):
     hojas = [h for h in xls.sheet_names if "hortalizas" in h.lower()]
 
     if not hojas:
-        print("⚠️ No se encontraron hojas 'Hortalizas_'.")
+        print("⚠️ No se encontraron hojas 'hortalizas'.")
         return pd.DataFrame()
 
     registros = []
@@ -143,13 +138,11 @@ def procesar_excel(url_excel, fecha):
             print(f"⚠️ Error procesando hoja {hoja}: {e}")
             continue
 
-    if registros:
-        return pd.concat(registros, ignore_index=True)
-    return pd.DataFrame()
+    return pd.concat(registros, ignore_index=True) if registros else pd.DataFrame()
 
 
 # ==============================
-# 6. Guardar en SQLite
+# 6. Guardar en SQLite con prevención de duplicados
 # ==============================
 def guardar_sqlite(df):
     if df.empty:
@@ -157,6 +150,7 @@ def guardar_sqlite(df):
         return
 
     conn = sqlite3.connect(DB_PATH)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS precios (
             producto TEXT,
@@ -173,10 +167,18 @@ def guardar_sqlite(df):
         )
     """)
 
+    fecha = df["fecha_boletin"].iloc[0]
+    cur = conn.execute("SELECT COUNT(*) FROM precios WHERE fecha_boletin = ?", (fecha,))
+    exists = cur.fetchone()[0] > 0
+
+    if exists:
+        print(f"⛔ El boletín del {fecha} YA existe. No se inserta.")
+        conn.close()
+        return
+
     df.to_sql("precios", conn, if_exists="append", index=False)
     conn.close()
-
-    print(f"✅ {len(df)} registros agregados a SQLite.")
+    print(f"✅ {len(df)} registros agregados a SQLite (fecha {fecha}).")
 
 
 # ==============================
@@ -184,13 +186,23 @@ def guardar_sqlite(df):
 # ==============================
 def procesar_boletines():
     index = cargar_index()
-
     for meta in index:
-        url = meta["url_descarga"]
-        fecha = meta["fecha"]
-
-        df = procesar_excel(url, fecha)
+        df = procesar_excel(meta["url_descarga"], meta["fecha"])
         guardar_sqlite(df)
+
+
+# ==============================
+# 8. Auto-commit para GitHub Actions
+# ==============================
+def git_push():
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        subprocess.run(["git", "add", "."], check=True)
+        subprocess.run(["git", "commit", "-m", f"Actualización automática {now}"], check=True)
+        subprocess.run(["git", "push"], check=True)
+        print("✔ Cambios enviados a GitHub")
+    except Exception as e:
+        print("❌ Error al hacer git push:", e)
 
 
 # ==============================
@@ -198,3 +210,7 @@ def procesar_boletines():
 # ==============================
 if __name__ == "__main__":
     procesar_boletines()
+
+    # Solo hacer push si estamos en GitHub Actions
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        git_push()
